@@ -1,0 +1,170 @@
+name: Sync Upstream & Release RPM
+
+on:
+  schedule:
+    # Run every 6 hours
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      target_tag:
+        description: "Release tag to package as RPM (e.g. v0.1.7). Defaults to latest upstream release."
+        required: false
+        type: string
+      force_rebuild:
+        description: "Rebuild and re-upload RPM even if already present in release"
+        required: false
+        default: false
+        type: boolean
+      sync_branch:
+        description: "Sync main branch with upstream main"
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: sync-upstream-and-rpm
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync_upstream:
+    name: Sync with Upstream
+    runs-on: ubuntu-latest
+    if: github.event_name != 'workflow_dispatch' || inputs.sync_branch == true
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ github.token }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote and sync
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/pingdotgg/t3code.git || true
+          git fetch upstream --tags
+
+          # Sync main branch with upstream main if tracking main
+          echo "Merging upstream/main into main..."
+          git merge --ff-only upstream/main || {
+            echo "Fast-forward merge not possible; creating merge commit..."
+            git merge --no-edit -m "chore: sync with upstream" upstream/main || {
+              echo "Merge conflict detected; aborting merge."
+              git merge --abort || true
+              exit 1
+            }
+          }
+
+          echo "Pushing changes and tags to origin..."
+          git push origin main --tags
+
+  build_and_publish_rpm:
+    name: Build RPM and Append to Release
+    needs: [sync_upstream]
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      UPSTREAM_REPO: pingdotgg/t3code
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve target release tag
+        id: resolve_tag
+        run: |
+          set -euo pipefail
+          TARGET_TAG="${{ inputs.target_tag }}"
+
+          if [[ -z "$TARGET_TAG" ]]; then
+            echo "Fetching latest upstream release tag..."
+            TARGET_TAG="$(gh api "repos/${UPSTREAM_REPO}/releases/latest" --jq '.tag_name')"
+          fi
+
+          if [[ -z "$TARGET_TAG" || "$TARGET_TAG" == "null" ]]; then
+            echo "Error: Could not resolve a valid release tag from ${UPSTREAM_REPO}." >&2
+            exit 1
+          fi
+
+          echo "Target tag resolved: $TARGET_TAG"
+          echo "tag=$TARGET_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Check release status in our repository
+        id: check_release
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.resolve_tag.outputs.tag }}"
+          FORCE_REBUILD="${{ inputs.force_rebuild || 'false' }}"
+
+          echo "Checking if release $TAG exists in $GITHUB_REPOSITORY..."
+          OUR_RELEASE_JSON="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" 2>/dev/null || true)"
+
+          if [[ -z "$OUR_RELEASE_JSON" || "$OUR_RELEASE_JSON" == "null" ]]; then
+            echo "Release $TAG does not exist in our repo. Creating release..."
+            UPSTREAM_RELEASE="$(gh api "repos/${UPSTREAM_REPO}/releases/tags/$TAG")"
+            RELEASE_NAME="$(jq -r '.name // ""' <<<"$UPSTREAM_RELEASE")"
+            RELEASE_BODY="$(jq -r '.body // ""' <<<"$UPSTREAM_RELEASE")"
+            IS_PRERELEASE="$(jq -r '.prerelease // false' <<<"$UPSTREAM_RELEASE")"
+            IS_DRAFT="$(jq -r '.draft // false' <<<"$UPSTREAM_RELEASE")"
+
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "${RELEASE_NAME:-$TAG}" \
+              --notes "$RELEASE_BODY" \
+              --prerelease="$IS_PRERELEASE" \
+              --draft="$IS_DRAFT"
+
+            echo "Created release $TAG in $GITHUB_REPOSITORY."
+            echo "needs_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Release $TAG exists in our repo."
+            RPM_COUNT="$(jq -r '[.assets[] | select(.name | endswith(".rpm"))] | length' <<<"$OUR_RELEASE_JSON")"
+            if [[ "$RPM_COUNT" -gt 0 && "$FORCE_REBUILD" != "true" ]]; then
+              echo "RPM assets already attached to release $TAG and force_rebuild is false. Skipping build."
+              echo "needs_build=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "RPM assets missing or force_rebuild is true. Proceeding with RPM build."
+              echo "needs_build=true" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: Install packaging dependencies
+        if: steps.check_release.outputs.needs_build == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y alien rpm fakeroot curl jq
+
+      - name: Build RPM packages
+        if: steps.check_release.outputs.needs_build == 'true'
+        run: |
+          packaging/rpm/scripts/build-rpm.sh \
+            --tag "${{ steps.resolve_tag.outputs.tag }}" \
+            --output-dir release-rpm \
+            --upstream-repo "$UPSTREAM_REPO"
+
+      - name: Append RPM packages to release in our repository
+        if: steps.check_release.outputs.needs_build == 'true'
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.resolve_tag.outputs.tag }}"
+          echo "Uploading RPM assets to release $TAG in $GITHUB_REPOSITORY..."
+
+          shopt -s nullglob
+          ASSETS=(release-rpm/*.rpm release-rpm/SHA256SUMS-RPM)
+          if [[ ${#ASSETS[@]} -eq 0 ]]; then
+            echo "Error: No assets to upload." >&2
+            exit 1
+          fi
+
+          gh release upload "$TAG" "${ASSETS[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+          echo "Successfully uploaded RPM packages to release $TAG in $GITHUB_REPOSITORY."
